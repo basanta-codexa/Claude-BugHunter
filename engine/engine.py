@@ -102,7 +102,13 @@ class Engine:
         """Deterministic safety net: which out-of-scope hosts did the agent's PoC touch?"""
         blob = " ".join([str(f.get("request", "")), str(f.get("evidence", "")),
                          " ".join(f.get("hosts_contacted") or [])])
-        hosts = set(re.findall(r'https?://([A-Za-z0-9.\-]+)', blob)) | set(f.get("hosts_contacted") or [])
+        # Capture the whole authority (up to / ? # or whitespace), not just the
+        # leading label run — a URL can hide its real connect host behind userinfo
+        # (`inscope@evil.com`), a backslash, or an IPv6 literal, and the old
+        # `[A-Za-z0-9.\-]+` pattern truncated there and missed it (#277). in_scope_host
+        # resolves each authority the same way the request would (fails closed on a
+        # host it cannot parse), so an unparseable or off-scope authority is flagged.
+        hosts = set(re.findall(r'https?://([^\s/?#]+)', blob)) | set(f.get("hosts_contacted") or [])
         return sorted({h for h in hosts if h and not self.scope.in_scope_host(h)})
 
     # ---------------- osint (deterministic scope expansion) ----------------
@@ -132,7 +138,7 @@ class Engine:
             subs |= O.enumerate_subdomains(apex, log=self.eng.log)
         in_scope = [s for s in sorted(subs) if self.scope.in_scope_host(s)]
         self.eng.log(f"expand: {len(subs)} subdomain(s) -> {len(in_scope)} in scope; probing liveness...")
-        live, _ = O.probe_hosts(in_scope, log=self.eng.log)
+        live, _ = O.probe_hosts(in_scope, log=self.eng.log, scope=self.scope)
         new_seeds = sorted({t["url"] for t in live if t.get("url")})
         if new_seeds:
             self.scope.seeds = new_seeds
@@ -155,7 +161,8 @@ class Engine:
         from urllib.parse import urlparse
         # service / tech fingerprint of the seed target(s) — per-target (NOT subdomain enum)
         seed_hosts = sorted({urlparse(s).hostname for s in self.scope.seeds if urlparse(s).hostname})
-        tech, _ = O.probe_hosts(seed_hosts, log=self.eng.log)
+        seed_hosts = [h for h in seed_hosts if self.scope.in_scope_host(h)]   # don't probe out-of-scope seeds (#274)
+        tech, _ = O.probe_hosts(seed_hosts, log=self.eng.log, scope=self.scope)
         self.eng.state["targets"] = tech
         self.eng.save()
         for t in tech:

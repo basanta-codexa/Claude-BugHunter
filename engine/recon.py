@@ -374,11 +374,14 @@ def _gau_urls(scope, log):
     if not which("gau"):
         log("params: gau not installed — skipping historical param discovery")
         return {}
-    apexes = set()
-    for s in scope.seeds:
-        h = urlparse(s if "://" in s else "//" + s).hostname
-        if h:
-            apexes.add(".".join(h.split(".")[-2:]))
+    try:
+        from osint import enumeration_roots
+    except ImportError:
+        from .osint import enumeration_roots       # engine imported as a package
+    # enumeration_roots keeps multi-label TLDs intact (app.example.co.uk stays,
+    # not co.uk) and doesn't truncate IP seeds (#276); it replaces the old
+    # last-two-labels guess that queried whole public suffixes.
+    apexes = set(enumeration_roots(scope))
     urls = {}
     for apex in sorted(apexes):
         try:
@@ -402,6 +405,8 @@ def _katana_urls(scope, log, depth=2, timeout=150):
         return {}
     urls, crawled = {}, 0
     for seed in scope.seeds:
+        if not scope.in_scope_host(seed):           # never crawl an out-of-scope seed (#274)
+            continue
         try:
             out = subprocess.run(["katana", "-u", seed, "-silent", "-jc", "-d", str(depth),
                                   "-kf", "all", "-c", "10", "-timeout", "10", "-rl", "100"],
@@ -503,7 +508,8 @@ def classes_for_openapi(path, method, op, secured):
         add("saml")
     if any(k in pl for k in ("oauth", "keycloak", "/auth", "/login", "token")):
         add("auth-bypass")
-    has_param = any(pr.get("in") in ("query", "path") for pr in op.get("parameters", []))
+    has_param = any(isinstance(pr, dict) and pr.get("in") in ("query", "path")
+                    for pr in (op.get("parameters") or []))   # parameters may be null or hold $ref entries (#278)
     if has_param or method in ("post", "put", "patch"):
         add("sqli")
     if not cls:
@@ -524,6 +530,18 @@ def _on_base_authority(base, url):
         return False
 
 
+def _seed_origin(seed):
+    """`https://user@host:8443/v1?x=1` -> `https://host:8443`. Keeps a non-default
+    port (probing 80/443 instead silently returned nothing — #293/#278) and strips
+    userinfo, path, query and fragment. Returns '' if the host can't be parsed."""
+    u = urlparse(seed if "://" in seed else "https://" + seed)
+    host = u.hostname or ""
+    if not host:
+        return ""
+    netloc = host + (f":{u.port}" if u.port else "")
+    return f"{u.scheme or 'https'}://{netloc}"
+
+
 def auth_enforcement_sweep(spec, base, log=print, junk="zzz-pentest-nonexistent-00000",
                            *, allow_intrusive=False):
     """Probe declared-secured operations unauthenticated. By default, probe only GET.
@@ -536,9 +554,13 @@ def auth_enforcement_sweep(spec, base, log=print, junk="zzz-pentest-nonexistent-
     # (mirror the op-level `!= []` check below), else public ops are wrongly swept as broken-auth.
     glob = spec.get("security") not in (None, [])
     broken, n, skipped_writes = [], 0, 0
-    for path, methods in spec.get("paths", {}).items():
+    for path, methods in (spec.get("paths") or {}).items():
+        if not isinstance(methods, dict):           # x-* vendor ext / $ref Path Item (#278)
+            continue
         for m, op in methods.items():
             if m not in ("get", "post", "put", "patch", "delete"):
+                continue
+            if not isinstance(op, dict):             # null / non-object operation (#278)
                 continue
             if not (("security" in op and op["security"] != []) or ("security" not in op and glob)):
                 continue
@@ -548,11 +570,12 @@ def auth_enforcement_sweep(spec, base, log=print, junk="zzz-pentest-nonexistent-
             url = base + path
             if not _on_base_authority(base, url):   # path key rewrote the authority (#263) — never send
                 continue
-            for pp in op.get("parameters", []):
+            params = [pp for pp in (op.get("parameters") or []) if isinstance(pp, dict) and pp.get("name")]
+            for pp in params:
                 if pp.get("in") == "path":
                     url = url.replace("{%s}" % pp["name"], junk)
             url = url.replace("{", "").replace("}", "")
-            q = [f"{pp['name']}={junk}" for pp in op.get("parameters", [])
+            q = [f"{pp['name']}={junk}" for pp in params
                  if pp.get("in") == "query" and pp.get("required")]
             if q:
                 url += ("&" if "?" in url else "?") + "&".join(q)
@@ -591,9 +614,8 @@ def platform_recon(scope, log=print):
     from urllib.parse import urlparse
     items, seen = [], set()
     for seed in scope.seeds:
-        u = urlparse(seed if "://" in seed else "https://" + seed)
-        base = f"{u.scheme or 'https'}://{u.hostname}"
-        if base in seen:
+        base = _seed_origin(seed)                   # keeps the port (#293); '' if unparseable
+        if not base or base in seen:
             continue
         seen.add(base)
         if not scope.in_scope_host(base):
@@ -649,13 +671,12 @@ def openapi_recon(scope, log=print, *, allow_intrusive=False):
     """If the target exposes an OpenAPI schema, parse it into categorized (path,method,class) work
     units — the ideal deterministic recon for an API host. Returns already-expanded surface items."""
     import json as _json
-    items = []
+    items, seen = [], set()
     for seed in scope.seeds:
-        host = seed.rstrip("/")
-        if "://" not in host:
-            host = "https://" + host
-        if not scope.in_scope_host(host):
+        host = _seed_origin(seed)                   # origin only — never append onto a seed path/query (#278)
+        if not host or host in seen or not scope.in_scope_host(host):
             continue
+        seen.add(host)
         for op_path in OPENAPI_PATHS:
             code, body = _probe(host + op_path, allow=scope.in_scope_host)
             if code != 200 or not body.lstrip().startswith("{"):
@@ -668,11 +689,15 @@ def openapi_recon(scope, log=print, *, allow_intrusive=False):
             if not paths:
                 continue
             glob_sec = spec.get("security") not in (None, [])   # `security: []` == public, not secured
-            title = spec.get("info", {}).get("title", "API")
+            title = (spec.get("info") or {}).get("title", "API")   # `info: null` is valid OpenAPI
             noauth = 0
             for p, methods in paths.items():
+                if not isinstance(methods, dict):   # x-* vendor ext or a $ref Path Item, not operations (#278)
+                    continue
                 for m, opn in methods.items():
                     if m not in ("get", "post", "put", "patch", "delete"):
+                        continue
+                    if not isinstance(opn, dict):   # `"post": null` or a non-object operation (#278)
                         continue
                     secured = ("security" in opn and opn["security"] != []) or \
                               ("security" not in opn and glob_sec)

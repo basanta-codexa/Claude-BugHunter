@@ -51,3 +51,24 @@ class RedactionTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class LocationFieldRedaction(unittest.TestCase):
+    def test_capture_exchange_redacts_location_field_without_breaking_open_redirect(self):
+        import verifier
+        loc = "https://app.example.com/cb?access_token=AKIAIOSFODNN7EXAMPLE&email=a@b.com"
+        fetch = lambda url: (302, {"Location": loc}, loc, "")
+        scope = type("S", (), {"reject_reason": lambda self, u: None})()
+        ex = verifier.capture_exchange({"url": "https://app.example.com/go", "request": "GET /go"},
+                                       fetch, scope)["exchange"]
+        self.assertNotIn("AKIAIOSFODNN7EXAMPLE", ex["location"])
+        self.assertNotIn("a@b.com", ex["location"])
+        self.assertIn("app.example.com", ex["location"])   # host kept for open-redirect check
+
+    def test_none_location_preserved(self):
+        import verifier
+        fetch = lambda url: (200, {}, None, "ok")
+        scope = type("S", (), {"reject_reason": lambda self, u: None})()
+        ex = verifier.capture_exchange({"url": "https://x.example.com/", "request": "GET /"},
+                                       fetch, scope)["exchange"]
+        self.assertIsNone(ex["location"])

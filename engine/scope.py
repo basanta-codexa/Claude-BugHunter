@@ -111,7 +111,13 @@ def _is_cidr(rule):
         return False
 
 
-def _normalize_rule(rule):
+def _wildcard_to_regex(host):
+    """Mid-label wildcard host -> anchored regex, mirroring `cbh scope import`:
+    `staging-*.example.com` -> `re:^staging\\-[a-z0-9.-]*\\.example\\.com$`."""
+    return "re:^" + "[a-z0-9.-]*".join(re.escape(p) for p in host.split("*")) + "$"
+
+
+def _normalize_rule(rule, side="in"):
     """Reduce any rule-source form to a host (or keep re:/wildcard/CIDR as-is).
 
     `https://app.example.com:8443/login` -> `app.example.com`. Deny/allow rules are
@@ -130,12 +136,23 @@ def _normalize_rule(rule):
     low = r.lower()
     if "://" in low:
         low = low.split("://", 1)[1]
-    low = low.split("@")[-1]                       # drop userinfo
+    # Drop userinfo only from the authority (before the first / ? #), never an '@'
+    # that sits in a path or query (#277): `.../@internal`, `?u=a@evil.org` are not
+    # userinfo and must not re-point the rule at the text after the '@'.
+    authority = re.split(r"[/?#]", low, 1)[0]
+    low = authority.split("@")[-1] + low[len(authority):]
     tok = low.split()[0] if low.split() else low   # a trailing note ('(corp range)') is not the rule
-    if _is_cidr(tok):
-        return tok
+    low = tok                                       # the note is dropped for every rule form (#277), not just CIDR
+    if _is_cidr(low):
+        return low
     wild = low.startswith("*.")
     core = low[2:] if wild else low
+    if "*" in core:                                # a '*' that is not a leading '*.'
+        if side == "out":
+            # An out-of-scope mid-label wildcard becomes an anchored regex so it
+            # actually excludes (#298). In-scope keeps the '*' and so matches
+            # nothing (fail closed) — which is the safe direction.
+            return _wildcard_to_regex(("*." + core) if wild else core)
     bare = core.strip("[]").split("%")[0]          # IPv6 may be bracketed or %zone-scoped
     try:
         return str(ipaddress.ip_address(bare))     # literal IP (incl. unbracketed IPv6)
@@ -169,7 +186,7 @@ class Scope:
     def __init__(self, in_scope, out_of_scope=None, seeds=None, name="engagement"):
         self.warnings = []
         self.in_scope = [self._norm(p) for p in self._as_list(in_scope, "in_scope") if p.strip()]
-        self.out_of_scope = [self._validate_out_regex(self._norm(p))
+        self.out_of_scope = [self._validate_out_regex(self._norm(p, "out"))
                              for p in self._as_list(out_of_scope, "out_of_scope") if p.strip()]
         self.seeds = self._as_list(seeds, "seeds")
         self.name = name
@@ -190,8 +207,8 @@ class Scope:
                 f"host rule {literal!r}; fix it to restore regex matching")
             return literal
 
-    def _norm(self, rule):
-        normalized = _normalize_rule(rule)
+    def _norm(self, rule, side="in"):
+        normalized = _normalize_rule(rule, side)
         if normalized[:3].lower() == "re:":
             return normalized
         body = rule.strip().strip("`\"'").rstrip(".,; ")
