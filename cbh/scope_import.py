@@ -400,6 +400,18 @@ def program_from_json(obj, ref=""):
     if not isinstance(obj, dict) or not ("in_scope" in obj or "out_of_scope" in obj):
         raise ValueError("JSON is neither HackerOne MCP scope output nor a bounty-targets-data record")
     handle = str(obj.get("program") or obj.get("handle") or ref or "program")
+    total = obj.get("scope_total")
+    returned = len(obj.get("in_scope") or []) + len(obj.get("out_of_scope") or [])
+    total_is_int = isinstance(total, int) and not isinstance(total, bool)
+    if obj.get("scope_truncated") or (total_is_int and total > returned):
+        # A missing out-of-scope entry is a deny rule the engine never enforces, so
+        # an incomplete dump must not become a scope.md (fail closed, like every
+        # other ambiguous input in this module).
+        raise ValueError(
+            f"scope JSON is incomplete: {returned} of {total if total_is_int else '?'} structured "
+            f"scopes. A missing out-of-scope entry is a deny rule the engine would never enforce, so "
+            f"nothing was imported. Re-run the HackerOne MCP get_program_scope tool (current servers "
+            f"page through every scope), or paste the program page with --text.")
     p = Program(platform="hackerone", handle=handle, name=_one_line(obj.get("name") or "", 120),
                 url=f"https://hackerone.com/{urllib.parse.quote(handle, safe='')}")
     for key, side in (("in_scope", "in"), ("out_of_scope", "out")):

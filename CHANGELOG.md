@@ -38,6 +38,16 @@ versioning is loosely [SemVer](https://semver.org/) at the bundle level.
   `recon/<target>/REGRESSION.md` and advances the snapshot baseline.
 
 ### Security
+- **HackerOne MCP `get_program_scope` silently truncated scope at 100 assets — fixed.**
+  The tool fetched `structured_scopes(first: 100)` in one request and ignored `pageInfo`, so a
+  program with more than 100 scoped assets lost the tail: twilio (113) and nextcloud (102) both
+  do today, and all 13 of twilio's dropped entries are out-of-scope. A missing out-of-scope entry
+  is a deny rule the engine never sees, so an excluded host stays testable. The connection is now
+  walked page by page (deduped, bounded at 2,000 assets), `get_program_scope` returns
+  `scope_returned` beside `scope_total` and sets `scope_truncated` if the cap is ever hit, and
+  `cbh scope import` refuses a JSON dump whose counts do not match instead of writing a scope.md
+  that silently omits deny rules. Tests: `tests/test_hackerone_mcp.py`,
+  `tests/test_scope_import.py`.
 - **Scope deny rule fails open on an inline comment — fixed (reported by @basanta-codexa).**
   `engine/scope.py::_normalize_rule` returned the whole rule string when the first token
   parsed as a CIDR, so a trailing note (`10.9.0.0/16 # sensitive lab`, `10.9.0.0/16 (corp)`,

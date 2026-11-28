@@ -16,6 +16,10 @@ standard library and reuses the HackerOne GraphQL client shape from
 | `get_my_program` | Yes | One program's policy and full scope as your account sees it. |
 | `list_my_reports` | Yes | Your own reports and their state, optionally for one program. |
 
+`get_program_scope` pages through the whole structured-scope connection; compare `scope_returned`
+with `scope_total` to confirm nothing was cut off (a `scope_truncated` flag means the 2,000-asset
+safety cap was hit, and `cbh scope import` refuses such a dump rather than writing a partial scope).
+
 The logged-in tools appear only when `HACKERONE_API_USERNAME` and `HACKERONE_API_TOKEN` are set. They use the
 read-only Hacker API; nothing in this server submits or changes anything on HackerOne. Create the token under
 HackerOne **Settings → API Token**.

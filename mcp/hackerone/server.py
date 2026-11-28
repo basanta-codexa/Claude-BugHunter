@@ -49,6 +49,10 @@ SERVER_INFO = {"name": "hackerone", "version": "1.0.0"}
 HACKER_API = "https://api.hackerone.com/v1/hackers"
 TIMEOUT = 25
 MAX_LIMIT = 50
+_SCOPE_PAGE = 100
+_SCOPE_MAX_PAGES = 20   # 2,000 scoped assets; the largest public program today has 113
+_SCOPE_FIELDS = ("asset_type asset_identifier eligible_for_bounty "
+                 "eligible_for_submission max_severity instruction")
 _THIN_BODY = 200  # bodies shorter than this trigger the distilled-pattern fallback note
 SEVERITIES = ["none", "low", "medium", "high", "critical"]
 
@@ -227,22 +231,64 @@ def get_program(args):
     }
 
 
+def _structured_scopes(handle, include_policy=True):
+    """Every non-archived structured scope for a program, following `pageInfo`.
+
+    The connection returns at most `first` nodes per page, and the tool used one
+    `first: 100` request, so a program with more than 100 scoped assets silently
+    lost the tail — twilio has 113 and nextcloud 102 today. A dropped out-of-scope
+    entry is a deny rule the engine never sees, so an excluded host stays testable.
+
+    Returns `(team_meta, nodes, total_count, truncated)`; `team_meta` is None when
+    the program does not exist. `truncated` is True when the page cap stopped the
+    walk before `total_count` was reached (or an upstream ignored `after`).
+    """
+    nodes, total, meta, cursor = [], None, {}, None
+    for _ in range(_SCOPE_MAX_PAGES):
+        after = f', after: "{_escape(cursor)}"' if cursor else ""
+        policy = "policy " if include_policy else ""
+        team = _graphql(
+            f'{{ team(handle: "{_escape(handle)}") {{ handle name {policy}'
+            f'structured_scopes(first: {_SCOPE_PAGE}{after}, archived: false) {{ total_count '
+            f'pageInfo {{ hasNextPage endCursor }} nodes {{ {_SCOPE_FIELDS} }} }} }} }}'
+        ).get("team")
+        if not team:
+            return None, [], None, False
+        if not meta:
+            meta = team
+        conn = team.get("structured_scopes") or {}
+        total = conn.get("total_count")
+        nodes.extend(conn.get("nodes") or [])
+        page = conn.get("pageInfo") or {}
+        nxt = page.get("endCursor")
+        if not page.get("hasNextPage") or not nxt or nxt == cursor:
+            break                  # last page, or an upstream that ignored `after`
+        cursor = nxt
+    seen, unique = set(), []
+    for node in nodes:             # dedupe in case the scope changes between pages
+        key = (node.get("asset_type"), node.get("asset_identifier"))
+        if key not in seen:
+            seen.add(key)
+            unique.append(node)
+    truncated = isinstance(total, int) and len(unique) < total
+    return meta, unique, total, truncated
+
+
 def get_program_scope(args):
     handle = _handle(args)
     include_policy = bool(args.get("include_policy", True))
-    team = _graphql(
-        f'{{ team(handle: "{_escape(handle)}") {{ handle name {"policy" if include_policy else ""} '
-        f'structured_scopes(first: 100, archived: false) {{ total_count nodes {{ asset_type asset_identifier '
-        f'eligible_for_bounty eligible_for_submission max_severity instruction }} }} }} }}').get("team")
-    if not team:
+    team, nodes, total, truncated = _structured_scopes(handle, include_policy)
+    if team is None:
         raise ToolError(f"No public program '{handle}'. Private programs need the logged-in tools.")
-    scopes = team.get("structured_scopes") or {}
     result = {
         "program": team.get("handle"), "name": team.get("name"),
-        "scope_total": scopes.get("total_count"),
-        "in_scope": [s for s in (scopes.get("nodes") or []) if s.get("eligible_for_submission")],
-        "out_of_scope": [s for s in (scopes.get("nodes") or []) if not s.get("eligible_for_submission")],
+        "scope_total": total,
+        "scope_returned": len(nodes),
+        "in_scope": [s for s in nodes if s.get("eligible_for_submission")],
+        "out_of_scope": [s for s in nodes if not s.get("eligible_for_submission")],
     }
+    if truncated:
+        result["scope_truncated"] = True
     if include_policy:
         result["policy"] = team.get("policy")
     return result
@@ -361,8 +407,9 @@ PUBLIC_TOOLS = [
       "annotations": _RO}, get_program),
     ({"name": "get_program_scope",
       "description": "A public HackerOne program's structured scope (in-scope and out-of-scope assets, bounty "
-                     "eligibility, max severity, per-asset instructions) and its policy text. Check this "
-                     "before touching any asset.",
+                     "eligibility, max severity, per-asset instructions) and its policy text. Every page of the "
+                     "scope is returned; scope_returned vs scope_total shows whether anything was cut off. Check "
+                     "this before touching any asset.",
       "inputSchema": {"type": "object", "properties": {
           "program": _PROGRAM,
           "include_policy": {"type": "boolean", "default": True,

@@ -115,6 +115,82 @@ class PublicToolTests(unittest.TestCase):
                 h1.get_program({"program": "acme"})
 
 
+class ProgramScopeTests(unittest.TestCase):
+    """get_program_scope must follow pageInfo, not stop at one 100-node page."""
+
+    def test_scope_follows_page_info_past_the_first_page(self):
+        queries = []
+
+        def fake(req, timeout=None):
+            query = json.loads(req.data.decode())["query"]
+            queries.append(query)
+            if "after:" in query:
+                return _Resp({"data": {"team": {"handle": "acme", "name": "Acme",
+                    "structured_scopes": {"total_count": 3,
+                        "pageInfo": {"hasNextPage": False, "endCursor": "c2"},
+                        "nodes": [{"asset_type": "URL", "asset_identifier": "b.example",
+                                   "eligible_for_submission": False}]}}}})
+            return _Resp({"data": {"team": {"handle": "acme", "name": "Acme",
+                "structured_scopes": {"total_count": 3,
+                    "pageInfo": {"hasNextPage": True, "endCursor": "c1"},
+                    "nodes": [
+                        {"asset_type": "URL", "asset_identifier": "a.example",
+                         "eligible_for_submission": True},
+                        {"asset_type": "URL", "asset_identifier": "x.example",
+                         "eligible_for_submission": False}]}}}})
+
+        with patch.object(h1.urllib.request, "urlopen", fake):
+            out = h1.get_program_scope({"program": "acme", "include_policy": False})
+        self.assertEqual(len(queries), 2)
+        self.assertIn('after: "c1"', queries[1])
+        self.assertEqual(out["scope_total"], 3)
+        self.assertEqual(out["scope_returned"], 3)
+        self.assertNotIn("scope_truncated", out)
+        self.assertEqual([s["asset_identifier"] for s in out["in_scope"]], ["a.example"])
+        self.assertEqual([s["asset_identifier"] for s in out["out_of_scope"]],
+                         ["x.example", "b.example"])
+
+    def test_scope_page_cap_reports_truncation(self):
+        calls = {"n": 0}
+
+        def fake(req, timeout=None):
+            calls["n"] += 1
+            return _Resp({"data": {"team": {"handle": "acme", "structured_scopes": {
+                "total_count": 9999,
+                "pageInfo": {"hasNextPage": True, "endCursor": f"c{calls['n']}"},
+                "nodes": [{"asset_type": "URL", "asset_identifier": f"h{calls['n']}.example",
+                           "eligible_for_submission": True}]}}}})
+
+        with patch.object(h1.urllib.request, "urlopen", fake):
+            out = h1.get_program_scope({"program": "acme", "include_policy": False})
+        self.assertEqual(calls["n"], h1._SCOPE_MAX_PAGES)
+        self.assertTrue(out["scope_truncated"])
+        self.assertEqual(out["scope_returned"], h1._SCOPE_MAX_PAGES)
+
+    def test_scope_stops_when_the_cursor_does_not_advance(self):
+        calls = {"n": 0}
+
+        def fake(req, timeout=None):
+            calls["n"] += 1
+            return _Resp({"data": {"team": {"handle": "acme", "structured_scopes": {
+                "total_count": 50,
+                "pageInfo": {"hasNextPage": True, "endCursor": "same"},
+                "nodes": [{"asset_type": "URL", "asset_identifier": "a.example",
+                           "eligible_for_submission": True}]}}}})
+
+        with patch.object(h1.urllib.request, "urlopen", fake):
+            out = h1.get_program_scope({"program": "acme", "include_policy": False})
+        self.assertEqual(calls["n"], 2)          # first page + one retry, then stop
+        self.assertEqual(out["scope_returned"], 1)   # deduped
+        self.assertTrue(out["scope_truncated"])      # 1 of 50: never claim completeness
+
+    def test_missing_program_is_toolerror(self):
+        with patch.object(h1.urllib.request, "urlopen",
+                          _urlopen_returning({"data": {"team": None}})):
+            with self.assertRaises(h1.ToolError):
+                h1.get_program_scope({"program": "nope"})
+
+
 class EscapingTests(unittest.TestCase):
     def test_quote_in_program_is_escaped_not_broken_out(self):
         captured = {}

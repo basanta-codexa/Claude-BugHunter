@@ -291,6 +291,31 @@ class OtherPlatformTests(unittest.TestCase):
         tags = [c.split(":", 1)[0] for c in p.conduct]
         self.assertEqual(tags, ["rate limit", "required header", "no DoS"])
 
+    def test_incomplete_mcp_scope_json_is_rejected(self):
+        truncated = {"program": "twilio", "name": "Twilio", "scope_total": 113,
+                     "in_scope": [{"asset_type": "URL", "asset_identifier": "twilio.com",
+                                   "eligible_for_submission": True}],
+                     "out_of_scope": []}
+        with self.assertRaises(ValueError) as ctx:
+            si.program_from_json(truncated)
+        self.assertIn("incomplete", str(ctx.exception))
+        self.assertIn("113", str(ctx.exception))
+
+    def test_complete_mcp_scope_json_with_total_is_accepted(self):
+        out = {"program": "acme", "scope_total": 2,
+               "in_scope": [{"asset_type": "URL", "asset_identifier": "app.example.com",
+                             "eligible_for_submission": True}],
+               "out_of_scope": [{"asset_type": "URL", "asset_identifier": "old.example.com",
+                                 "eligible_for_submission": False}]}
+        s = _scope_of(si.render(si.program_from_json(out)))
+        self.assertEqual(s.in_scope, [r"re:^app\.example\.com$"])
+        self.assertEqual(s.out_of_scope, [r"re:^old\.example\.com$"])
+
+    def test_scope_truncated_flag_is_rejected_even_without_total(self):
+        with self.assertRaises(ValueError):
+            si.program_from_json({"program": "acme", "scope_truncated": True,
+                                  "in_scope": [], "out_of_scope": []})
+
     def test_json_that_is_not_a_scope_is_rejected(self):
         with self.assertRaises(ValueError):
             si.program_from_json({"hello": "world"})
