@@ -22,6 +22,12 @@ def _now():
 
 class Engagement:
     def __init__(self, base, name):
+        # Fail closed on a name that would escape <base>: it is joined onto the
+        # base dir, so `../escaped`, `a/b`, a drive/NUL char, or `.`/`..` write
+        # state.json and evidence/ outside the engagement (#279).
+        if not isinstance(name, str) or not name or name in (".", "..") \
+                or any(c in name for c in "/\\:\x00"):
+            raise ValueError(f"invalid engagement name {name!r} (no separators, not empty, not . or ..)")
         self.dir = os.path.join(os.path.expanduser(base), name)
         self.name = name
         os.makedirs(os.path.join(self.dir, "evidence"), exist_ok=True)
@@ -47,7 +53,10 @@ class Engagement:
 
     def save(self):
         tmp = self.state_path + ".tmp"
-        json.dump(self.state, open(tmp, "w", encoding="utf-8"), indent=2)
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(self.state, f, indent=2)
+            f.flush()
+            os.fsync(f.fileno())   # durable before rename: a crash mid-save can't leave truncated state (#292)
         os.replace(tmp, self.state_path)
 
     def log(self, msg):

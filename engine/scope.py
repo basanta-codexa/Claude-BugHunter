@@ -153,12 +153,25 @@ def _normalize_rule(rule):
 
 
 class Scope:
+    @staticmethod
+    def _as_list(value, field):
+        """Fail closed on a malformed scope field. A bare string is iterable, so a
+        string where a list is expected was walked one character at a time and the
+        deny list silently never matched (#279) — refuse it instead."""
+        if value is None:
+            return []
+        if isinstance(value, str) or not isinstance(value, (list, tuple)):
+            raise ValueError(f"scope field {field!r} must be a list of strings, got {type(value).__name__}")
+        if any(not isinstance(p, str) for p in value):
+            raise ValueError(f"scope field {field!r} must contain only strings")
+        return value
+
     def __init__(self, in_scope, out_of_scope=None, seeds=None, name="engagement"):
         self.warnings = []
-        self.in_scope = [self._norm(p) for p in (in_scope or []) if p.strip()]
+        self.in_scope = [self._norm(p) for p in self._as_list(in_scope, "in_scope") if p.strip()]
         self.out_of_scope = [self._validate_out_regex(self._norm(p))
-                             for p in (out_of_scope or []) if p.strip()]
-        self.seeds = seeds or []
+                             for p in self._as_list(out_of_scope, "out_of_scope") if p.strip()]
+        self.seeds = self._as_list(seeds, "seeds")
         self.name = name
 
     def _validate_out_regex(self, rule):

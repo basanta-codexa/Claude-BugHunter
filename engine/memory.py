@@ -182,7 +182,10 @@ def _write_rollup(host, tech_stack, tested, confirmed):
                       for f in hc_conf],
     }
     tmp = p + ".tmp"
-    json.dump(doc, open(tmp, "w", encoding="utf-8"), indent=2)
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(doc, f, indent=2)
+        f.flush()
+        os.fsync(f.fileno())   # durable before rename (#292)
     os.replace(tmp, p)
 
 
